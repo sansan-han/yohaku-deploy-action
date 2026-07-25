@@ -4,6 +4,10 @@
 
 这是一个利用 GitHub Action 去构建私有版本站点并部署到远程服务器的工作流。
 
+> 此 Fork 部署 `sansan-han/yohaku-custom@main`。构建与部署在同一个临时
+> runner job 中完成，不会把闭源 `release.zip` 保存到 Actions cache 或
+> artifact。
+
 ## Why?
 
 这里的项目关系现在更准确地说是：
@@ -90,7 +94,8 @@ git checkout bc07cfa
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `SOURCE_REPO` | `innei-dev/Yohaku` | 私有源码仓库（格式：`owner/repo`） |
+| `SOURCE_REPO` | `sansan-han/yohaku-custom` | 私有定制源码仓库（格式：`owner/repo`） |
+| `SOURCE_REF` | `main` | 要部署的分支；workflow 会先解析并固定到精确 commit SHA |
 | `BUILD_COMMAND` | `pnpm --filter @yohaku/web build:ci` | 构建命令。 workflow 会在构建后自动执行 standalone 打包与 zip；如果你的项目结构不同，可修改此命令 |
 | `STANDALONE_SUBPATH` | `standalone/apps/web` | 构建产物中 standalone 包的相对路径。Yohaku 与旧版 Shiroi 若结构不同，请按需调整 |
 
@@ -113,9 +118,8 @@ git checkout bc07cfa
 
 - `HOST` 服务器地址
 - `USER` 服务器用户名
-- `PASSWORD` 服务器密码
 - `PORT` 服务器 SSH 端口
-- `KEY` 服务器 SSH Key（可选，密码 key 二选一）
+- `KEY` 服务器 SSH Key
 - `GH_PAT` 可访问当前私有源码仓库的 Github Token
 - `BASE_URL`、`NEXT_PUBLIC_API_URL`、`NEXT_PUBLIC_GATEWAY_URL` 供 CI 构建注入（见上一节；需与服务器 `.env` 一致）
 

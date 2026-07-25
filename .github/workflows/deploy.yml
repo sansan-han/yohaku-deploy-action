@@ -10,99 +10,92 @@ on:
   repository_dispatch:
     types: [trigger-workflow]
 
-permissions: write-all
+permissions:
+  contents: write
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}
   cancel-in-progress: true
 
 env:
   HASH_FILE: build_hash
-  SOURCE_REPO: innei-dev/Yohaku
+  SOURCE_REPO: sansan-han/yohaku-custom
+  SOURCE_REF: main
   BUILD_COMMAND: pnpm --filter @yohaku/web build:ci
   STANDALONE_SUBPATH: standalone/apps/web
 
 jobs:
-  prepare:
-    name: Prepare
+  check:
+    name: Check source revision
     runs-on: ubuntu-latest
     if: ${{ github.event.head_commit.message != 'Update hash file' }}
 
     outputs:
-      hash_content: ${{ steps.read_hash.outputs.hash_content }}
+      should_deploy: ${{ steps.compare.outputs.should_deploy }}
+      source_sha: ${{ steps.compare.outputs.source_sha }}
 
     steps:
-      - name: Checkout
+      - name: Checkout deploy configuration
         uses: actions/checkout@v4
-      - name: Read HASH_FILE content
-        id: read_hash
-        run: |
-          content=$(cat ${{ env.HASH_FILE }}) || true
-          echo "hash_content=$content" >> "$GITHUB_OUTPUT"
-  check:
-    name: Check Should Rebuild
-    runs-on: ubuntu-latest
-    needs: prepare
-    outputs:
-      canceled: ${{ steps.use_content.outputs.canceled }}
-
-    steps:
-      - uses: actions/checkout@v4
         with:
-          repository: innei-dev/Yohaku
-          token: ${{ secrets.GH_PAT }} # `GH_PAT` is a secret that contains your PAT
-          fetch-depth: 0
-          lfs: true
-          submodules: recursive
+          ref: main
 
-      - name: Use content from prev job and compare
-        id: use_content
+      - name: Compare deployed and source revisions
+        id: compare
         env:
-          FILE_HASH: ${{ needs.prepare.outputs.hash_content }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          file_hash=$FILE_HASH
-          current_hash=$(git rev-parse --short HEAD)
-          echo "File Hash: $file_hash"
-          echo "Current Git Hash: $current_hash"
-          if [ "$file_hash" == "$current_hash" ]; then
-            echo "Hashes match. Stopping workflow."
-            echo "canceled=true" >> $GITHUB_OUTPUT
+          deployed_hash="$(tr -d '[:space:]' < "$HASH_FILE" 2>/dev/null || true)"
+          source_sha="$(gh api "repos/${SOURCE_REPO}/commits/${SOURCE_REF}" --jq '.sha')"
+
+          echo "Deployed revision: ${deployed_hash:-none}"
+          echo "Source revision: $source_sha"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$deployed_hash" && "$source_sha" == "$deployed_hash"* ]]; then
+            echo "Source is already deployed."
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Hashes do not match. Continuing workflow."
+            echo "A new source revision will be deployed."
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
-    name: Build artifact
+  build-deploy:
+    name: Build and deploy
     runs-on: ubuntu-latest
     needs: check
-    if: ${{needs.check.outputs.canceled != 'true'}}
+    if: ${{ needs.check.outputs.should_deploy == 'true' }}
 
-    strategy:
-      matrix:
-        node-version: [lts/*]
-    outputs:
-      sha_short: ${{ steps.store.outputs.sha_short }}
-      branch: ${{ steps.store.outputs.branch }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout private source
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          token: ${{ secrets.GH_PAT }} # `GH_PAT` is a secret that contains your PAT
-          fetch-depth: 0
+          ref: ${{ needs.check.outputs.source_sha }}
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
           lfs: true
           submodules: recursive
+          persist-credentials: false
 
       - name: Checkout LFS objects
         run: git lfs checkout
+
+      - name: Verify source revision
+        env:
+          SOURCE_SHA: ${{ needs.check.outputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
       - uses: pnpm/action-setup@v2
 
-      - name: Use Node.js ${{ matrix.node-version }}
+      - name: Use Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: lts/*
           cache: 'pnpm'
-      - uses: jongwooo/next-cache@v1
+
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
+
       - name: Build project
         env:
           BASE_URL: ${{ secrets.BASE_URL }}
@@ -118,85 +111,45 @@ jobs:
           echo ';process.title = "Yohaku (NextJS)"' >> server.js
           cd "$GITHUB_WORKSPACE"
           mkdir -p assets
-          rm -f assets/release.zip
-          (cd apps/web/.next && zip --symlinks -r "$GITHUB_WORKSPACE/assets/release.zip" ./* -x "dev/*" -x "cache/*")
+          (cd apps/web/.next && zip -q --symlinks -r "$GITHUB_WORKSPACE/assets/release.zip" ./* -x "dev/*" -x "cache/*")
 
-      # - uses: actions/upload-artifact@v4
-      #   with:
-      #     name: dist
-      #     path: assets/release.zip
-      #     retention-days: 7
-      - name: Cache Build Artifacts
-        id: cache-primes
-        uses: actions/cache/save@v4
-        with:
-          path: assets
-          key: ${{ github.run_number }}-release
-
-      - name: Store artifact commit version
-        shell: bash
-        id: store
-        run: |
-          sha_short=$(git rev-parse --short HEAD)
-          branch_name=$(git rev-parse --abbrev-ref HEAD)
-          echo "sha_short=$sha_short" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch_name" >> "$GITHUB_OUTPUT"
-
-  deploy:
-    name: Deploy artifact
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      # - name: Download artifact
-      #   uses: actions/download-artifact@v4
-      #   with:
-      #     name: dist
-      - name: Checkout code
+      - name: Checkout deploy configuration
         uses: actions/checkout@v4
-        
-      - name: Restore cached Build Artifacts
-        id: cache-primes-restore
-        uses: actions/cache/restore@v4
         with:
-          path: |
-            assets
-          key: ${{ github.run_number }}-release
-      - name: Move assets to root
-        run: mv assets/release.zip release.zip
+          ref: main
+          path: .deploy-config
 
-      - name: Prepare standalone PM2 config
-        run: cp pm2/ecosystem.config.js ecosystem.config.js
+      - name: Prepare deployment files
+        run: |
+          mv assets/release.zip release.zip
+          cp .deploy-config/pm2/ecosystem.config.js ecosystem.config.js
 
-      - name: copy file via ssh password
-        uses: appleboy/scp-action@v0.1.7
+      - name: Copy release archive
+        uses: appleboy/scp-action@v1.0.0
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USER }}
-          password: ${{ secrets.PASSWORD }}
           key: ${{ secrets.KEY }}
           port: ${{ secrets.PORT }}
           source: 'release.zip'
           target: '/tmp/yohaku'
 
-      - name: copy PM2 config via ssh password
-        uses: appleboy/scp-action@v0.1.7
+      - name: Copy PM2 configuration
+        uses: appleboy/scp-action@v1.0.0
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USER }}
-          password: ${{ secrets.PASSWORD }}
           key: ${{ secrets.KEY }}
           port: ${{ secrets.PORT }}
           source: 'ecosystem.config.js'
           target: '/tmp/yohaku'
 
-      - name: Exec deploy script with SSH
-        uses: appleboy/ssh-action@master
-
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.5
         with:
           command_timeout: 5m
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USER }}
-          password: ${{ secrets.PASSWORD }}
           key: ${{ secrets.KEY }}
           port: ${{ secrets.PORT }}
           script: |
@@ -230,42 +183,18 @@ jobs:
             pm2 save
             echo "Deployed successfully"
 
-      - name: After deploy script
-        run: |
-          hash=${{ needs.build.outputs.sha_short }}
-          # curl -X "POST" "https://mx.innei.in/api/v2/fn/shiro/new-version-hook" -H 'Content-Type: application/json' -d "{\"hash\": \"$hash\", \"key\": \"\"}"
-          ${{ secrets.AFTER_DEPLOY_SCRIPT }}
-  store:
-    name: Store artifact commit version
-    runs-on: ubuntu-latest
-    needs: [deploy, build]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal token
-          fetch-depth: 0 # otherwise, you will failed to push refs to dest repo
-      # Get the commit version from the build job
-      - name: Use outputs from build
+      - name: Record deployed revision
+        working-directory: .deploy-config
         env:
-          SHA_SHORT: ${{ needs.build.outputs.sha_short }}
-          BRANCH: ${{ needs.build.outputs.branch }}
+          SOURCE_SHA: ${{ needs.check.outputs.source_sha }}
         run: |
-          echo "SHA Short from build: $SHA_SHORT"
-          echo "Branch from build: $BRANCH"
-      - name: Write hash to file
-        env:
-          SHA_SHORT: ${{ needs.build.outputs.sha_short }}
-
-        run: echo $SHA_SHORT > ${{ env.HASH_FILE }}
-      - name: Commit files
-        run: |
+          printf '%s\n' "$SOURCE_SHA" > "$HASH_FILE"
+          if git diff --quiet -- "$HASH_FILE"; then
+            echo "Deployment revision is already recorded."
+            exit 0
+          fi
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add ${{ env.HASH_FILE }}
-          git commit -a -m "Update hash file"
-      - name: Push changes
-        uses: ad-m/github-push-action@master
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          branch: ${{ github.ref }}
+          git add "$HASH_FILE"
+          git commit -m "Update hash file"
+          git push origin HEAD:main
